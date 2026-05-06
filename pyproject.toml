@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poke-llm-rl"
+version = "0.1.0"
+description = "Fine-tune a local Qwen LLM to play Pokemon Red with PyBoy and online RL."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "accelerate>=1.10.0",
+  "numpy>=2.1.0",
+  "peft>=0.17.0",
+  "Pillow>=11.0.0",
+  "pyboy>=2.6.0",
+  "safetensors>=0.5.0",
+  "torch>=2.8.0",
+  "transformers>=4.57.0",
+  "tqdm>=4.67.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "bitsandbytes>=0.48.0",
+  "flash-attn>=2.8.0; platform_system == 'Linux'",
+  "tensorboard>=2.20.0",
+  "wandb>=0.22.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
