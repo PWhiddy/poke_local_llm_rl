@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +43,12 @@ def set_seed(seed: int) -> None:
 class SequencePolicyTrainer:
     def __init__(self, config: ExperimentConfig):
         self.config = config
+        if config.train.group_size <= 0:
+            raise ValueError("train.group_size must be positive")
+        if config.train.parallel_envs <= 0:
+            raise ValueError("train.parallel_envs must be positive")
+        if config.train.group_size % config.train.parallel_envs != 0:
+            raise ValueError("train.parallel_envs must evenly divide train.group_size")
         set_seed(config.seed)
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,12 +63,12 @@ class SequencePolicyTrainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            torch_dtype=self._torch_dtype(config.dtype),
+            dtype=self._torch_dtype(config.dtype),
         )
         self.reference_model = AutoModelForCausalLM.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            torch_dtype=self._torch_dtype(config.dtype),
+            dtype=self._torch_dtype(config.dtype),
         )
         self.reference_model.eval()
         for parameter in self.reference_model.parameters():
@@ -109,7 +114,7 @@ class SequencePolicyTrainer:
 
     def build_envs(self, round_horizon: int) -> list[PokemonRedEnv]:
         envs = []
-        for env_idx in range(self.config.train.parallel_envs):
+        for env_idx in range(self.config.train.group_size):
             env = PokemonRedEnv(
                 self.config.env,
                 self.config.rom_path,
@@ -122,14 +127,16 @@ class SequencePolicyTrainer:
         return envs
 
     @torch.no_grad()
-    def generate_completion(self, prompt: str) -> tuple[str, list[int], float, float, float]:
+    def generate_batch(self, prompts: list[str]) -> list[tuple[str, list[int], float, float, float, list[int]]]:
         encoded = self.tokenizer(
-            prompt,
+            prompts,
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=self.config.model.max_prompt_tokens,
         ).to(self.accelerator.device)
-        output = self.model.generate(
+        model = self.accelerator.unwrap_model(self.model)
+        output = model.generate(
             **encoded,
             max_new_tokens=self.config.model.max_new_tokens,
             do_sample=True,
@@ -139,29 +146,75 @@ class SequencePolicyTrainer:
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        prompt_len = encoded["input_ids"].shape[1]
-        completion_ids = output[0, prompt_len:].tolist()
-        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-        old_logprob, ref_logprob, entropy = self.score_completion(prompt, completion_ids)
-        return completion_text, completion_ids, old_logprob, ref_logprob, entropy
+        prompt_ids_batch = encoded["input_ids"].tolist()
+        prompt_lengths = encoded["attention_mask"].sum(dim=1).tolist()
+        completion_ids_batch: list[list[int]] = []
+        completion_texts: list[str] = []
+        trimmed_prompt_ids: list[list[int]] = []
+
+        for row, prompt_len, prompt_ids in zip(output.tolist(), prompt_lengths, prompt_ids_batch, strict=True):
+            completion_ids = row[prompt_len:]
+            while completion_ids and completion_ids[-1] == self.tokenizer.pad_token_id:
+                completion_ids.pop()
+            completion_ids_batch.append(completion_ids)
+            completion_texts.append(self.tokenizer.decode(completion_ids, skip_special_tokens=True))
+            trimmed_prompt_ids.append(prompt_ids[:prompt_len])
+
+        scores = self.score_batch(trimmed_prompt_ids, completion_ids_batch)
+        results: list[tuple[str, list[int], float, float, float, list[int]]] = []
+        for completion_text, completion_ids, prompt_ids, score in zip(
+            completion_texts,
+            completion_ids_batch,
+            trimmed_prompt_ids,
+            scores,
+            strict=True,
+        ):
+            old_logprob, ref_logprob, entropy = score
+            results.append((completion_text, completion_ids, old_logprob, ref_logprob, entropy, prompt_ids))
+        return results
 
     @torch.no_grad()
-    def score_completion(self, prompt: str, completion_ids: list[int]) -> tuple[float, float, float]:
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.model.max_prompt_tokens)
-        input_ids = torch.tensor([prompt_ids["input_ids"][0].tolist() + completion_ids], device=self.accelerator.device)
-        attention_mask = torch.ones_like(input_ids, device=self.accelerator.device)
-        prompt_len = prompt_ids["input_ids"].shape[1]
-        completion_len = len(completion_ids)
+    def score_batch(
+        self,
+        prompt_ids_batch: list[list[int]],
+        completion_ids_batch: list[list[int]],
+    ) -> list[tuple[float, float, float]]:
+        combined_ids = [
+            prompt_ids + completion_ids
+            for prompt_ids, completion_ids in zip(prompt_ids_batch, completion_ids_batch, strict=True)
+        ]
+        max_len = max(len(ids) for ids in combined_ids)
+        pad_id = self.tokenizer.pad_token_id
+        input_ids = torch.full(
+            (len(combined_ids), max_len),
+            fill_value=pad_id,
+            dtype=torch.long,
+            device=self.accelerator.device,
+        )
+        attention_mask = torch.zeros_like(input_ids, device=self.accelerator.device)
+        for row_idx, ids in enumerate(combined_ids):
+            seq_len = len(ids)
+            input_ids[row_idx, :seq_len] = torch.tensor(ids, dtype=torch.long, device=self.accelerator.device)
+            attention_mask[row_idx, :seq_len] = 1
+
         model_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         ref_outputs = self.reference_model(input_ids=input_ids, attention_mask=attention_mask)
-        token_slice = slice(prompt_len - 1, prompt_len + completion_len - 1)
-        target_tokens = input_ids[:, prompt_len:]
-        model_logprobs = F.log_softmax(model_outputs.logits[:, token_slice, :], dim=-1)
-        ref_logprobs = F.log_softmax(ref_outputs.logits[:, token_slice, :], dim=-1)
-        gathered_model = model_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
-        gathered_ref = ref_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
-        entropy = -(model_logprobs.exp() * model_logprobs).sum(dim=-1).mean().item()
-        return gathered_model.mean().item(), gathered_ref.mean().item(), entropy
+        results: list[tuple[float, float, float]] = []
+        for row_idx, (prompt_ids, completion_ids) in enumerate(zip(prompt_ids_batch, completion_ids_batch, strict=True)):
+            prompt_len = len(prompt_ids)
+            completion_len = len(completion_ids)
+            if completion_len == 0:
+                results.append((0.0, 0.0, 0.0))
+                continue
+            token_slice = slice(prompt_len - 1, prompt_len + completion_len - 1)
+            target_tokens = input_ids[row_idx : row_idx + 1, prompt_len : prompt_len + completion_len]
+            model_logprobs = F.log_softmax(model_outputs.logits[row_idx : row_idx + 1, token_slice, :], dim=-1)
+            ref_logprobs = F.log_softmax(ref_outputs.logits[row_idx : row_idx + 1, token_slice, :], dim=-1)
+            gathered_model = model_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+            gathered_ref = ref_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+            entropy = -(model_logprobs.exp() * model_logprobs).sum(dim=-1).mean().item()
+            results.append((gathered_model.mean().item(), gathered_ref.mean().item(), entropy))
+        return results
 
     def collect_rollouts(
         self,
@@ -178,7 +231,8 @@ class SequencePolicyTrainer:
         }
         episode_returns = [0.0 for _ in envs]
         terminated_returns: list[float] = []
-        total_batch_steps = self.config.train.rollout_rounds_per_update * len(envs)
+        total_batch_steps = self.config.train.rollout_rounds_per_update * self.config.train.group_size
+        chunk_size = self.config.train.parallel_envs
         progress = tqdm(
             total=total_batch_steps,
             desc=f"Rollout {update_idx}",
@@ -187,55 +241,65 @@ class SequencePolicyTrainer:
         )
         try:
             for _ in range(self.config.train.rollout_rounds_per_update):
-                for env_idx, env in enumerate(envs):
-                    env.round_horizon = horizon_for_update(self.config.env, update_idx)
-                    prompt = build_prompt(
-                        states[env_idx],
-                        previous_action=env.previous_action,
-                        round_idx=env.round_idx,
-                        max_buttons=self.config.env.max_buttons_per_turn,
-                    )
-                    completion, completion_ids, old_logprob, ref_logprob, entropy = self.generate_completion(prompt)
-                    parsed = parse_completion(completion, self.config.env.max_buttons_per_turn)
-                    step = env.step(parsed)
-                    prompt_ids = self.tokenizer(
-                        prompt,
-                        truncation=True,
-                        max_length=self.config.model.max_prompt_tokens,
-                    )["input_ids"]
-                    transitions.append(
-                        Transition(
-                            prompt=prompt,
-                            completion=completion,
-                            action=parsed,
-                            reward=step.reward.total,
-                            prompt_ids=prompt_ids,
-                            completion_ids=completion_ids,
-                            old_logprob=old_logprob,
-                            ref_logprob=ref_logprob,
-                            entropy=entropy,
+                for chunk_start in range(0, self.config.train.group_size, chunk_size):
+                    chunk_end = chunk_start + chunk_size
+                    chunk_envs = envs[chunk_start:chunk_end]
+                    chunk_states = states[chunk_start:chunk_end]
+                    for env in chunk_envs:
+                        env.round_horizon = horizon_for_update(self.config.env, update_idx)
+                    prompts = [
+                        build_prompt(
+                            state,
+                            previous_action=env.previous_action,
+                            round_idx=env.round_idx,
+                            max_buttons=self.config.env.max_buttons_per_turn,
                         )
-                    )
-                    metrics["reward_total"] += step.reward.total
-                    metrics["reward_tile"] += step.reward.unique_tile_reward
-                    metrics["reward_event"] += step.reward.event_flag_reward
-                    metrics["format_failures"] += 0 if parsed.valid else 1
-                    episode_returns[env_idx] += step.reward.total
-                    progress.update(1)
-                    progress.set_postfix(
-                        avg_step_reward=f"{metrics['reward_total'] / max(len(transitions), 1):.4f}",
-                        avg_episode_return=(
-                            f"{(sum(terminated_returns) / len(terminated_returns)):.4f}"
-                            if terminated_returns
-                            else "pending"
-                        ),
-                    )
-                    if step.done:
-                        terminated_returns.append(episode_returns[env_idx])
-                        episode_returns[env_idx] = 0.0
-                        states[env_idx] = env.reset(round_horizon=horizon_for_update(self.config.env, update_idx))
-                    else:
-                        states[env_idx] = step.state
+                        for state, env in zip(chunk_states, chunk_envs, strict=True)
+                    ]
+                    batch_outputs = self.generate_batch(prompts)
+                    for local_idx, (env, prompt, batch_output) in enumerate(
+                        zip(chunk_envs, prompts, batch_outputs, strict=True)
+                    ):
+                        completion, completion_ids, old_logprob, ref_logprob, entropy, prompt_ids = batch_output
+                        print(completion)
+                        parsed = parse_completion(completion, self.config.env.max_buttons_per_turn)
+                        step = env.step(parsed)
+                        env_idx = chunk_start + local_idx
+                        transitions.append(
+                            Transition(
+                                prompt=prompt,
+                                completion=completion,
+                                action=parsed,
+                                reward=step.reward.total,
+                                prompt_ids=prompt_ids,
+                                completion_ids=completion_ids,
+                                old_logprob=old_logprob,
+                                ref_logprob=ref_logprob,
+                                entropy=entropy,
+                            )
+                        )
+                        metrics["reward_total"] += step.reward.total
+                        metrics["reward_tile"] += step.reward.unique_tile_reward
+                        metrics["reward_event"] += step.reward.event_flag_reward
+                        metrics["format_failures"] += 0 if parsed.valid else 1
+                        episode_returns[env_idx] += step.reward.total
+                        progress.update(1)
+                        progress.set_postfix(
+                            avg_step_reward=f"{metrics['reward_total'] / max(len(transitions), 1):.4f}",
+                            avg_episode_return=(
+                                f"{(sum(terminated_returns) / len(terminated_returns)):.4f}"
+                                if terminated_returns
+                                else "pending"
+                            ),
+                            llm_batch=chunk_size,
+                            group_size=self.config.train.group_size,
+                        )
+                        if step.done:
+                            terminated_returns.append(episode_returns[env_idx])
+                            episode_returns[env_idx] = 0.0
+                            states[env_idx] = env.reset(round_horizon=horizon_for_update(self.config.env, update_idx))
+                        else:
+                            states[env_idx] = step.state
         finally:
             progress.close()
         count = max(len(transitions), 1)

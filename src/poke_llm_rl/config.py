@@ -52,6 +52,7 @@ class EnvConfig:
 
 @dataclass(slots=True)
 class TrainConfig:
+    group_size: int = 16
     parallel_envs: int = 4
     updates: int = 2000
     rollout_rounds_per_update: int = 64
