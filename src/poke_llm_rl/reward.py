@@ -49,8 +49,10 @@ class RewardTracker:
         behavior_reward = 0.0
         if not parsed_action.buttons:
             behavior_reward += self.config.noop_penalty
-        if len(parsed_action.buttons) >= 2 and len(set(parsed_action.buttons)) == 1:
-            behavior_reward += self.config.repeated_action_penalty
+        else:
+            print(f"sucsessfully parsed actions: {parsed_action.buttons}")
+        #if len(parsed_action.buttons) >= 2 and len(set(parsed_action.buttons)) == 1:
+        #    behavior_reward += self.config.repeated_action_penalty
 
         total = unique_tile_reward + event_flag_reward + formatting_reward + behavior_reward
         return RewardBreakdown(

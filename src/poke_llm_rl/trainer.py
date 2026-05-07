@@ -65,7 +65,7 @@ class SequencePolicyTrainer:
         self.model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            torch_dtype=self._torch_dtype(config.dtype),
+            dtype=self._torch_dtype(config.dtype),
         )
         self.reference_model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
@@ -324,6 +324,7 @@ class SequencePolicyTrainer:
                         zip(chunk_envs, prompt_texts, images, batch_outputs, strict=True)
                     ):
                         completion, completion_ids, old_logprob, ref_logprob, entropy = batch_output
+                        #print(completion)
                         parsed = parse_completion(completion, self.config.env.max_buttons_per_turn)
                         step = env.step(parsed)
                         env_idx = chunk_start + local_idx
