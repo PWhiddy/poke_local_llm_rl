@@ -21,10 +21,12 @@ class RewardTracker:
     config: RewardConfig
     seen_tiles: set[tuple[int, int, int]] = field(default_factory=set)
     max_event_flag_count: int = 0
+    last_actions: list[str] = field(default_factory=list)
 
     def reset(self, initial_state: EmulatorState) -> None:
         self.seen_tiles = {initial_state.unique_tile_key}
         self.max_event_flag_count = initial_state.event_flag_count
+        self.last_actions = []
 
     def score_transition(
         self,
@@ -52,6 +54,8 @@ class RewardTracker:
             behavior_reward += self.config.noop_penalty
         else:
             print(f"sucsessfully parsed actions: {parsed_action.buttons}")
+        if parsed_action.buttons == self.last_actions:
+            behavior_reward += self.config.repeated_action_penalty
         #if len(parsed_action.buttons) >= 2 and len(set(parsed_action.buttons)) == 1:
         #    behavior_reward += self.config.repeated_action_penalty
 

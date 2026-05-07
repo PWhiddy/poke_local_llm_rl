@@ -87,6 +87,7 @@ class ExperimentConfig:
     init_state_path: str
     map_data_path: str
     output_dir: str
+    load_checkpoint: str
     device: str
     dtype: str
     model: ModelConfig
@@ -122,6 +123,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         init_state_path=raw["init_state_path"],
         map_data_path=raw["map_data_path"],
         output_dir=raw["output_dir"],
+        load_checkpoint=raw["load_checkpoint"],
         device=raw["device"],
         dtype=raw["dtype"],
         model=ModelConfig(**raw["model"]),

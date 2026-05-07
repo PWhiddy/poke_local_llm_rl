@@ -20,6 +20,8 @@ from poke_llm_rl.config import ExperimentConfig, horizon_for_update
 from poke_llm_rl.env import PokemonRedEnv
 from poke_llm_rl.prompts import build_prompt_text
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 @dataclass(slots=True)
 class Transition:
@@ -105,6 +107,30 @@ class SequencePolicyTrainer:
             self.reference_model,
             self.optimizer,
         )
+
+        if config.load_checkpoint != "":
+            self.load_checkpoint(config.load_checkpoint)
+
+
+    def load_checkpoint(self, checkpoint_dir: str) -> None:
+ 
+        unwrapped = self.accelerator.unwrap_model(self.model)
+
+        if self.config.model.use_lora:
+            # load_adapter updates LoRA weights in-place
+            unwrapped.load_adapter(checkpoint_dir, adapter_name="default")
+        else:
+            # load_state_dict updates base model weights in-place
+            loaded = AutoModelForImageTextToText.from_pretrained(
+                checkpoint_dir,
+                trust_remote_code=self.config.model.trust_remote_code,
+                dtype=self._torch_dtype(self.config.dtype),
+            )
+            unwrapped.load_state_dict(loaded.state_dict())
+            del loaded
+
+        self.processor = AutoProcessor.from_pretrained(checkpoint_dir)
+        self.tokenizer = self.processor.tokenizer
 
     @staticmethod
     def _torch_dtype(dtype_name: str) -> torch.dtype:
