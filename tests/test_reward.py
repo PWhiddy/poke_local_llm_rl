@@ -11,6 +11,7 @@ from poke_llm_rl.state import EmulatorState
 def make_state(map_id: int, x: int, y: int, event_flags: int) -> EmulatorState:
     return EmulatorState(
         frame=np.zeros((2, 2), dtype=np.int32),
+        screen_rgba=np.zeros((4, 4, 4), dtype=np.uint8),
         map_id=map_id,
         map_name=f"Map {map_id}",
         x=x,

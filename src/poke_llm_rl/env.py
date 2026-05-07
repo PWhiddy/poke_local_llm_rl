@@ -76,15 +76,21 @@ class PokemonRedEnv:
         return state
 
     def current_state(self) -> EmulatorState:
-        rgba = np.array(self.pyboy.screen.ndarray[..., 0], copy=True)
-        pooled = rgba.reshape(
-            rgba.shape[0] // self.config.downsample_factor,
+        screen_rgba = np.array(self.pyboy.screen.ndarray, copy=True)
+        grayscale = screen_rgba[..., 0]
+        pooled = grayscale.reshape(
+            grayscale.shape[0] // self.config.downsample_factor,
             self.config.downsample_factor,
-            rgba.shape[1] // self.config.downsample_factor,
+            grayscale.shape[1] // self.config.downsample_factor,
             self.config.downsample_factor,
         ).mean(axis=(1, 3))
         frame = quantize_frame(pooled, self.config.grayscale_buckets)
-        return extract_emulator_state(frame=frame, memory_reader=self.read_memory, map_data_path=self.map_data_path)
+        return extract_emulator_state(
+            frame=frame,
+            screen_rgba=screen_rgba,
+            memory_reader=self.read_memory,
+            map_data_path=self.map_data_path,
+        )
 
     def read_memory(self, address: int) -> int:
         return int(self.pyboy.memory[address])

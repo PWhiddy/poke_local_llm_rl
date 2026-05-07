@@ -25,6 +25,7 @@ DEFAULT_MAP_DATA_PATH = Path("assets/map_data.json")
 @dataclass(slots=True)
 class EmulatorState:
     frame: np.ndarray
+    screen_rgba: np.ndarray
     map_id: int
     map_name: str
     x: int
@@ -92,12 +93,18 @@ def map_name(map_id: int, map_data_path: str | Path = DEFAULT_MAP_DATA_PATH) -> 
     return load_map_names(map_data_path).get(map_id, f"Unknown Map {map_id}")
 
 
-def extract_emulator_state(frame: np.ndarray, memory_reader, map_data_path: str | Path = DEFAULT_MAP_DATA_PATH) -> EmulatorState:
+def extract_emulator_state(
+    frame: np.ndarray,
+    screen_rgba: np.ndarray,
+    memory_reader,
+    map_data_path: str | Path = DEFAULT_MAP_DATA_PATH,
+) -> EmulatorState:
     current_map_id = int(memory_reader(MAP_N_ADDRESS))
     party_levels = [int(memory_reader(address)) for address in LEVELS_ADDRESSES]
     event_bits = read_event_bits(memory_reader)
     return EmulatorState(
         frame=frame,
+        screen_rgba=screen_rgba,
         map_id=current_map_id,
         map_name=map_name(current_map_id, map_data_path),
         x=int(memory_reader(X_POS_ADDRESS)),

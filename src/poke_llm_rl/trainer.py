@@ -10,23 +10,24 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from peft import LoraConfig, get_peft_model
+from PIL import Image
 from torch.optim import AdamW
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoModelForImageTextToText, AutoProcessor, get_cosine_schedule_with_warmup
 
 from poke_llm_rl.actions import ParsedAction, parse_completion
 from poke_llm_rl.config import ExperimentConfig, horizon_for_update
 from poke_llm_rl.env import PokemonRedEnv
-from poke_llm_rl.prompts import build_prompt
+from poke_llm_rl.prompts import build_prompt_text
 
 
 @dataclass(slots=True)
 class Transition:
-    prompt: str
+    prompt_text: str
+    screen_rgba: np.ndarray
     completion: str
     action: ParsedAction
     reward: float
-    prompt_ids: list[int]
     completion_ids: list[int]
     old_logprob: float
     ref_logprob: float
@@ -53,22 +54,23 @@ class SequencePolicyTrainer:
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.accelerator = Accelerator(gradient_accumulation_steps=config.train.gradient_accumulation_steps)
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
         )
+        self.tokenizer = self.processor.tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            dtype=self._torch_dtype(config.dtype),
+            torch_dtype=self._torch_dtype(config.dtype),
         )
-        self.reference_model = AutoModelForCausalLM.from_pretrained(
+        self.reference_model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            dtype=self._torch_dtype(config.dtype),
+            torch_dtype=self._torch_dtype(config.dtype),
         )
         self.reference_model.eval()
         for parameter in self.reference_model.parameters():
@@ -126,15 +128,56 @@ class SequencePolicyTrainer:
             envs.append(env)
         return envs
 
-    @torch.no_grad()
-    def generate_batch(self, prompts: list[str]) -> list[tuple[str, list[int], float, float, float, list[int]]]:
-        encoded = self.tokenizer(
-            prompts,
-            return_tensors="pt",
+    def _image_to_pil(self, image: np.ndarray) -> Image.Image:
+        return Image.fromarray(image.astype(np.uint8), mode="RGBA")
+
+    def _chat_text(self, prompt_text: str) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        return self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _processor_inputs(self, prompt_texts: list[str], images: list[np.ndarray]):
+        chat_texts = [self._chat_text(prompt_text) for prompt_text in prompt_texts]
+        pil_images = [self._image_to_pil(image) for image in images]
+        return self.processor(
+            text=chat_texts,
+            images=pil_images,
             padding=True,
-            truncation=True,
-            max_length=self.config.model.max_prompt_tokens,
+            return_tensors="pt",
         ).to(self.accelerator.device)
+
+    def _build_mm_token_type_ids(
+        self,
+        encoded,
+        input_ids: torch.Tensor,
+        prompt_lengths: list[int],
+    ) -> torch.Tensor | None:
+        if "mm_token_type_ids" not in encoded:
+            return None
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        source_mm = encoded["mm_token_type_ids"]
+        for row_idx, prompt_len in enumerate(prompt_lengths):
+            mm_token_type_ids[row_idx, :prompt_len] = source_mm[row_idx, :prompt_len]
+        return mm_token_type_ids
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        prompt_texts: list[str],
+        images: list[np.ndarray],
+    ) -> list[tuple[str, list[int], float, float, float]]:
+        encoded = self._processor_inputs(prompt_texts, images)
         model = self.accelerator.unwrap_model(self.model)
         output = model.generate(
             **encoded,
@@ -146,42 +189,52 @@ class SequencePolicyTrainer:
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        prompt_ids_batch = encoded["input_ids"].tolist()
         prompt_lengths = encoded["attention_mask"].sum(dim=1).tolist()
         completion_ids_batch: list[list[int]] = []
         completion_texts: list[str] = []
-        trimmed_prompt_ids: list[list[int]] = []
 
-        for row, prompt_len, prompt_ids in zip(output.tolist(), prompt_lengths, prompt_ids_batch, strict=True):
+        for row, prompt_len in zip(output.tolist(), prompt_lengths, strict=True):
             completion_ids = row[prompt_len:]
             while completion_ids and completion_ids[-1] == self.tokenizer.pad_token_id:
                 completion_ids.pop()
             completion_ids_batch.append(completion_ids)
-            completion_texts.append(self.tokenizer.decode(completion_ids, skip_special_tokens=True))
-            trimmed_prompt_ids.append(prompt_ids[:prompt_len])
+            completion_texts.append(
+                self.processor.batch_decode(
+                    [completion_ids],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+            )
 
-        scores = self.score_batch(trimmed_prompt_ids, completion_ids_batch)
-        results: list[tuple[str, list[int], float, float, float, list[int]]] = []
-        for completion_text, completion_ids, prompt_ids, score in zip(
-            completion_texts,
-            completion_ids_batch,
-            trimmed_prompt_ids,
-            scores,
-            strict=True,
-        ):
-            old_logprob, ref_logprob, entropy = score
-            results.append((completion_text, completion_ids, old_logprob, ref_logprob, entropy, prompt_ids))
-        return results
+        scores = self.score_batch(prompt_texts, images, completion_ids_batch)
+        return [
+            (completion_text, completion_ids, old_logprob, ref_logprob, entropy)
+            for completion_text, completion_ids, (old_logprob, ref_logprob, entropy) in zip(
+                completion_texts,
+                completion_ids_batch,
+                scores,
+                strict=True,
+            )
+        ]
 
     @torch.no_grad()
     def score_batch(
         self,
-        prompt_ids_batch: list[list[int]],
+        prompt_texts: list[str],
+        images: list[np.ndarray],
         completion_ids_batch: list[list[int]],
     ) -> list[tuple[float, float, float]]:
+        encoded = self._processor_inputs(prompt_texts, images)
+        prompt_ids_batch = encoded["input_ids"].tolist()
+        prompt_lengths = encoded["attention_mask"].sum(dim=1).tolist()
         combined_ids = [
-            prompt_ids + completion_ids
-            for prompt_ids, completion_ids in zip(prompt_ids_batch, completion_ids_batch, strict=True)
+            prompt_ids[:prompt_len] + completion_ids
+            for prompt_ids, prompt_len, completion_ids in zip(
+                prompt_ids_batch,
+                prompt_lengths,
+                completion_ids_batch,
+                strict=True,
+            )
         ]
         max_len = max(len(ids) for ids in combined_ids)
         pad_id = self.tokenizer.pad_token_id
@@ -191,17 +244,26 @@ class SequencePolicyTrainer:
             dtype=torch.long,
             device=self.accelerator.device,
         )
-        attention_mask = torch.zeros_like(input_ids, device=self.accelerator.device)
+        attention_mask = torch.zeros_like(input_ids)
         for row_idx, ids in enumerate(combined_ids):
             seq_len = len(ids)
             input_ids[row_idx, :seq_len] = torch.tensor(ids, dtype=torch.long, device=self.accelerator.device)
             attention_mask[row_idx, :seq_len] = 1
 
-        model_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        ref_outputs = self.reference_model(input_ids=input_ids, attention_mask=attention_mask)
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": encoded["pixel_values"],
+            "image_grid_thw": encoded["image_grid_thw"],
+        }
+        mm_token_type_ids = self._build_mm_token_type_ids(encoded, input_ids, prompt_lengths)
+        if mm_token_type_ids is not None:
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
+
+        model_outputs = self.model(**model_inputs)
+        ref_outputs = self.reference_model(**model_inputs)
         results: list[tuple[float, float, float]] = []
-        for row_idx, (prompt_ids, completion_ids) in enumerate(zip(prompt_ids_batch, completion_ids_batch, strict=True)):
-            prompt_len = len(prompt_ids)
+        for row_idx, (prompt_len, completion_ids) in enumerate(zip(prompt_lengths, completion_ids_batch, strict=True)):
             completion_len = len(completion_ids)
             if completion_len == 0:
                 results.append((0.0, 0.0, 0.0))
@@ -247,8 +309,8 @@ class SequencePolicyTrainer:
                     chunk_states = states[chunk_start:chunk_end]
                     for env in chunk_envs:
                         env.round_horizon = horizon_for_update(self.config.env, update_idx)
-                    prompts = [
-                        build_prompt(
+                    prompt_texts = [
+                        build_prompt_text(
                             state,
                             previous_action=env.previous_action,
                             round_idx=env.round_idx,
@@ -256,22 +318,22 @@ class SequencePolicyTrainer:
                         )
                         for state, env in zip(chunk_states, chunk_envs, strict=True)
                     ]
-                    batch_outputs = self.generate_batch(prompts)
-                    for local_idx, (env, prompt, batch_output) in enumerate(
-                        zip(chunk_envs, prompts, batch_outputs, strict=True)
+                    images = [state.screen_rgba for state in chunk_states]
+                    batch_outputs = self.generate_batch(prompt_texts, images)
+                    for local_idx, (env, prompt_text, image, batch_output) in enumerate(
+                        zip(chunk_envs, prompt_texts, images, batch_outputs, strict=True)
                     ):
-                        completion, completion_ids, old_logprob, ref_logprob, entropy, prompt_ids = batch_output
-                        print(completion)
+                        completion, completion_ids, old_logprob, ref_logprob, entropy = batch_output
                         parsed = parse_completion(completion, self.config.env.max_buttons_per_turn)
                         step = env.step(parsed)
                         env_idx = chunk_start + local_idx
                         transitions.append(
                             Transition(
-                                prompt=prompt,
+                                prompt_text=prompt_text,
+                                screen_rgba=image,
                                 completion=completion,
                                 action=parsed,
                                 reward=step.reward.total,
-                                prompt_ids=prompt_ids,
                                 completion_ids=completion_ids,
                                 old_logprob=old_logprob,
                                 ref_logprob=ref_logprob,
@@ -310,13 +372,38 @@ class SequencePolicyTrainer:
         metrics["episodes_finished"] = float(len(terminated_returns))
         return transitions, metrics, states
 
-    def _sequence_logprob_and_entropy(self, prompt_ids: list[int], completion_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sequence_logprob_and_entropy(
+        self,
+        prompt_text: str,
+        screen_rgba: np.ndarray,
+        completion_ids: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoded = self._processor_inputs([prompt_text], [screen_rgba])
+        prompt_len = int(encoded["attention_mask"][0].sum().item())
+        prompt_ids = encoded["input_ids"][0, :prompt_len].tolist()
         input_ids = torch.tensor([prompt_ids + completion_ids], device=self.accelerator.device)
         attention_mask = torch.ones_like(input_ids)
-        prompt_len = len(prompt_ids)
+        mm_token_type_ids = None
+        if "mm_token_type_ids" in encoded:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[:, :prompt_len] = encoded["mm_token_type_ids"][:, :prompt_len]
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": encoded["pixel_values"],
+            "image_grid_thw": encoded["image_grid_thw"],
+        }
+        if mm_token_type_ids is not None:
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
+
+        outputs = self.model(**model_inputs)
+        with torch.no_grad():
+            ref_outputs = self.reference_model(**model_inputs)
         completion_len = len(completion_ids)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        ref_outputs = self.reference_model(input_ids=input_ids, attention_mask=attention_mask)
+        if completion_len == 0:
+            zero = torch.tensor(0.0, device=self.accelerator.device)
+            return zero, zero, zero
         token_slice = slice(prompt_len - 1, prompt_len + completion_len - 1)
         target_tokens = input_ids[:, prompt_len:]
         model_logprobs = F.log_softmax(outputs.logits[:, token_slice, :], dim=-1)
@@ -335,9 +422,21 @@ class SequencePolicyTrainer:
         entropy_sum = 0.0
         steps = 0
 
-        for _ in range(self.config.train.ppo_epochs):
+        epoch_progress = tqdm(
+            range(self.config.train.ppo_epochs),
+            desc="PPO Epochs",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for _ in epoch_progress:
             random.shuffle(indices)
-            for start in range(0, len(indices), self.config.train.minibatch_size):
+            minibatch_progress = tqdm(
+                range(0, len(indices), self.config.train.minibatch_size),
+                desc="PPO Minibatches",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            for start in minibatch_progress:
                 batch_indices = indices[start : start + self.config.train.minibatch_size]
                 losses = []
                 kls = []
@@ -346,7 +445,8 @@ class SequencePolicyTrainer:
                     transition = transitions[idx]
                     advantage = torch.tensor(advantages[idx], device=self.accelerator.device, dtype=torch.float32)
                     new_logprob, ref_logprob, entropy = self._sequence_logprob_and_entropy(
-                        transition.prompt_ids,
+                        transition.prompt_text,
+                        transition.screen_rgba,
                         transition.completion_ids,
                     )
                     old_logprob = torch.tensor(transition.old_logprob, device=self.accelerator.device)
@@ -374,6 +474,12 @@ class SequencePolicyTrainer:
                 kl_sum += torch.stack(kls).mean().item()
                 entropy_sum += torch.stack(entropies).mean().item()
                 steps += 1
+                minibatch_progress.set_postfix(
+                    loss=f"{loss_sum / max(steps, 1):.4f}",
+                    kl=f"{kl_sum / max(steps, 1):.4f}",
+                )
+            minibatch_progress.close()
+        epoch_progress.close()
 
         return {
             "loss": loss_sum / max(steps, 1),
@@ -386,7 +492,7 @@ class SequencePolicyTrainer:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         unwrapped = self.accelerator.unwrap_model(self.model)
         unwrapped.save_pretrained(checkpoint_dir)
-        self.tokenizer.save_pretrained(checkpoint_dir)
+        self.processor.save_pretrained(checkpoint_dir)
 
     def train(self) -> None:
         history_path = self.output_dir / "metrics.jsonl"
