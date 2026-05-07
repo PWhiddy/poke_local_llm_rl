@@ -47,20 +47,20 @@ until_update = 1000000
 rounds = 1500
 
 [env.reward]
-unique_tile_weight = 0.05
-event_flag_weight = 2.0
-format_penalty = -0.2
+unique_tile_weight = 0.15
+event_flag_weight = 5.0
+format_penalty = -0.1
 noop_penalty = -0.02
-repeated_action_penalty = 0.00
+repeated_action_penalty = 0.001
 
 [train]
-group_size = 16
-parallel_envs = 16
+group_size = 32
+parallel_envs = 32
 updates = 2000
 rollout_rounds_per_update = 64
 gamma = 0.995
 ppo_epochs = 2
-minibatch_size = 4
+minibatch_size = 8
 learning_rate = 5.0e-6
 weight_decay = 0.01
 warmup_ratio = 0.03
@@ -70,7 +70,7 @@ kl_beta = 0.02
 entropy_beta = 0.001
 gradient_accumulation_steps = 1
 log_every_updates = 5
-save_every_updates = 50
+save_every_updates = 5
 eval_every_updates = 50
 
 [logging]
