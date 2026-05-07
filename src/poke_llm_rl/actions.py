@@ -23,7 +23,7 @@ def system_output_format(max_buttons: int) -> str:
     return (
         "Valid buttons: up, down, left, right, a, b\n" # excluding start & select for now
         "Respond in exactly this format:\n"
-        "<think>one or two short sentences of reasoning</think>\n"
+        "<think>you must think here for one or two short sentences of reasoning about what youre trying to do in the game</think>\n"
         "<actions>put comma separated buttons here (up to 8)</actions>"
     )
 

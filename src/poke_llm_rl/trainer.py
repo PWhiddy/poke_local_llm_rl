@@ -351,7 +351,7 @@ class SequencePolicyTrainer:
                         zip(chunk_envs, prompt_texts, images, batch_outputs, strict=True)
                     ):
                         completion, completion_ids, old_logprob, ref_logprob, entropy = batch_output
-                        #print(completion)
+                        print(completion)
                         parsed = parse_completion(completion, self.config.env.max_buttons_per_turn)
                         step = env.step(parsed)
                         env_idx = chunk_start + local_idx

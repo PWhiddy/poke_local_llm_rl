@@ -4,7 +4,7 @@ rom_path = "PokemonRed.gb"
 init_state_path = "assets/init_game.state"
 map_data_path = "assets/map_data.json"
 output_dir = "outputs/qwen35-pokemon-red"
-load_checkpoint = ""
+load_checkpoint = "outputs/qwen35-pokemon-red/checkpoint-far-65"
 device = "cuda"
 dtype = "bfloat16"
 
@@ -12,8 +12,8 @@ dtype = "bfloat16"
 model_name_or_path = "Qwen/Qwen3.5-0.8B"
 trust_remote_code = true
 use_lora = true
-lora_r = 64
-lora_alpha = 128
+lora_r = 128
+lora_alpha = 256
 lora_dropout = 0.05
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 max_prompt_tokens = 1536
@@ -23,7 +23,7 @@ top_p = 0.95
 repetition_penalty = 1.02
 
 [env]
-headless = true
+headless = false
 downsample_factor = 8
 grayscale_buckets = 16
 action_hold_frames = 8
@@ -55,8 +55,8 @@ noop_penalty = -0.02
 repeated_action_penalty = 0.001
 
 [train]
-group_size = 32
-parallel_envs = 32
+group_size = 4
+parallel_envs = 4
 updates = 2000
 rollout_rounds_per_update = 64
 gamma = 0.995
@@ -67,7 +67,7 @@ weight_decay = 0.01
 warmup_ratio = 0.03
 grad_clip_norm = 1.0
 ppo_clip_epsilon = 0.2
-kl_beta = 0.1
+kl_beta = 0.04
 entropy_beta = 0.002
 gradient_accumulation_steps = 1
 log_every_updates = 5
