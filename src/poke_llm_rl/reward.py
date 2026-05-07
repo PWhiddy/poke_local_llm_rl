@@ -47,7 +47,8 @@ class RewardTracker:
         formatting_reward = 0.0 if parsed_action.valid else self.config.format_penalty
 
         behavior_reward = 0.0
-        if not parsed_action.buttons:
+        if not parsed_action.valid: #not parsed_action.buttons:
+            #print(f"invalid actions: {parsed_action.buttons}")
             behavior_reward += self.config.noop_penalty
         else:
             print(f"sucsessfully parsed actions: {parsed_action.buttons}")

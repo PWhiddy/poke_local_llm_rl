@@ -61,6 +61,7 @@ class SequencePolicyTrainer:
         self.tokenizer = self.processor.tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self.model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
@@ -70,7 +71,7 @@ class SequencePolicyTrainer:
         self.reference_model = AutoModelForImageTextToText.from_pretrained(
             config.model.model_name_or_path,
             trust_remote_code=config.model.trust_remote_code,
-            torch_dtype=self._torch_dtype(config.dtype),
+            dtype=self._torch_dtype(config.dtype),
         )
         self.reference_model.eval()
         for parameter in self.reference_model.parameters():

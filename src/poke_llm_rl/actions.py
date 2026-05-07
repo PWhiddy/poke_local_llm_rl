@@ -4,11 +4,11 @@ import re
 from dataclasses import dataclass
 
 VALID_BUTTONS = ("up", "down", "left", "right", "a", "b", "start", "select")
+# think optional
 ACTION_PATTERN = re.compile(
-    r"<think>(?P<think>.*?)</think>\s*<actions>(?P<actions>.*?)</actions>",
+    r"(?:<think>(?P<think>.*?)</think>\s*)?<actions>(?P<actions>.*?)</actions>",
     re.DOTALL | re.IGNORECASE,
 )
-
 
 @dataclass(slots=True)
 class ParsedAction:
@@ -21,10 +21,10 @@ class ParsedAction:
 
 def system_output_format(max_buttons: int) -> str:
     return (
+        "Valid buttons: up, down, left, right, a, b\n" # excluding start & select for now
         "Respond in exactly this format:\n"
         "<think>one or two short sentences of reasoning</think>\n"
-        f"<actions>comma-separated buttons, 1 to {max_buttons} total, using only "
-        "up,down,left,right,a,b,start,select</actions>"
+        "<actions>put comma separated buttons here (up to 8)</actions>"
     )
 
 
@@ -39,7 +39,8 @@ def parse_completion(completion: str, max_buttons: int) -> ParsedAction:
             error="missing_required_tags",
         )
 
-    thought = " ".join(match.group("think").split())
+    thought_match = match.group("think")
+    thought = " ".join(thought_match.split()) if thought_match else ""
     action_text = match.group("actions").strip().lower()
     buttons = [token.strip() for token in action_text.split(",") if token.strip()]
 
