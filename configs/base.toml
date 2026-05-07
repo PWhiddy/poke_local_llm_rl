@@ -70,7 +70,7 @@ ppo_clip_epsilon = 0.2
 kl_beta = 0.1
 entropy_beta = 0.002
 gradient_accumulation_steps = 1
-log_every_updates = 5
+log_every_updates = 1
 save_every_updates = 5
 eval_every_updates = 50
 

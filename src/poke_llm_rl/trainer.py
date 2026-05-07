@@ -400,6 +400,7 @@ class SequencePolicyTrainer:
         metrics["episodes_finished"] = float(len(terminated_returns))
         return transitions, metrics, states
 
+    
     def _sequence_logprob_and_entropy(
         self,
         prompt_text: str,
@@ -411,6 +412,7 @@ class SequencePolicyTrainer:
         prompt_ids = encoded["input_ids"][0, :prompt_len].tolist()
         input_ids = torch.tensor([prompt_ids + completion_ids], device=self.accelerator.device)
         attention_mask = torch.ones_like(input_ids)
+        
         mm_token_type_ids = None
         if "mm_token_type_ids" in encoded:
             mm_token_type_ids = torch.zeros_like(input_ids)
@@ -425,21 +427,46 @@ class SequencePolicyTrainer:
         if mm_token_type_ids is not None:
             model_inputs["mm_token_type_ids"] = mm_token_type_ids
 
-        outputs = self.model(**model_inputs)
-        with torch.no_grad():
-            ref_outputs = self.reference_model(**model_inputs)
         completion_len = len(completion_ids)
         if completion_len == 0:
             zero = torch.tensor(0.0, device=self.accelerator.device)
             return zero, zero, zero
+
         token_slice = slice(prompt_len - 1, prompt_len + completion_len - 1)
         target_tokens = input_ids[:, prompt_len:]
-        model_logprobs = F.log_softmax(outputs.logits[:, token_slice, :], dim=-1)
-        ref_logprobs = F.log_softmax(ref_outputs.logits[:, token_slice, :], dim=-1)
-        gathered_model = model_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
-        gathered_ref = ref_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+
+        torch.cuda.empty_cache() 
+
+        # --- STEP 1: REFERENCE MODEL (NO GRAD) ---
+        with torch.no_grad():
+            ref_outputs = self.reference_model(**model_inputs)
+            # Calculate logprobs and immediately gather to reduce dimensionality
+            ref_logprobs = F.log_softmax(ref_outputs.logits[:, token_slice, :], dim=-1)
+            gathered_ref = ref_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+            
+            # Wipe large tensors from VRAM immediately
+            del ref_outputs
+            del ref_logprobs
+            # Optional but helpful:
+            torch.cuda.empty_cache() 
+
+        # --- STEP 2: ACTIVE MODEL (WITH GRAD) ---
+        outputs = self.model(**model_inputs)
+        model_logits = outputs.logits[:, token_slice, :]
+        model_logprobs = F.log_softmax(model_logits, dim=-1)
+        
+        gathered_model = model_logprobs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1).mean(dim=-1)
+        
+        # Calculate entropy using a more memory-stable sum
+        # We do this before deleting model_logprobs
         entropy = -(model_logprobs.exp() * model_logprobs).sum(dim=-1).mean(dim=-1)
-        return gathered_model.mean(dim=-1), gathered_ref.mean(dim=-1), entropy
+
+        # Final cleanup of the active model's large tensors
+        del outputs
+        del model_logits
+        del model_logprobs
+
+        return gathered_model, gathered_ref, entropy
 
     def ppo_update(self, transitions: list[Transition]) -> dict[str, float]:
         rewards = np.array([transition.reward for transition in transitions], dtype=np.float32)
@@ -488,12 +515,18 @@ class SequencePolicyTrainer:
                         policy_loss = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
                         kl = torch.clamp(new_logprob - ref_logprob, min=0.0)
                         loss = policy_loss + self.config.train.kl_beta * kl - self.config.train.entropy_beta * entropy
-                        losses.append(loss)
+                        
+                        # --- THE FIX: Scale and Backprop immediately ---
+                        scaled_loss = loss / len(batch_indices)
+                        self.accelerator.backward(scaled_loss)
+                        
+                        # Detach so we don't retain the computation graph for logging
+                        losses.append(loss.detach())
                         kls.append(kl.detach())
                         entropies.append(entropy.detach())
 
+                    # Calculate batch loss just for logging/metrics
                     batch_loss = torch.stack(losses).mean()
-                    self.accelerator.backward(batch_loss)
                     
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.train.grad_clip_norm)
