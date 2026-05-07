@@ -23,6 +23,7 @@ from poke_llm_rl.prompts import build_prompt_text
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+
 @dataclass(slots=True)
 class Transition:
     prompt_text: str
@@ -111,9 +112,7 @@ class SequencePolicyTrainer:
         if config.load_checkpoint != "":
             self.load_checkpoint(config.load_checkpoint)
 
-
     def load_checkpoint(self, checkpoint_dir: str) -> None:
- 
         unwrapped = self.accelerator.unwrap_model(self.model)
 
         if self.config.model.use_lora:
@@ -172,6 +171,7 @@ class SequencePolicyTrainer:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
 
     def _processor_inputs(self, prompt_texts: list[str], images: list[np.ndarray]):
@@ -465,38 +465,42 @@ class SequencePolicyTrainer:
                 dynamic_ncols=True,
             )
             for start in minibatch_progress:
-                batch_indices = indices[start : start + self.config.train.minibatch_size]
-                losses = []
-                kls = []
-                entropies = []
-                for idx in batch_indices:
-                    transition = transitions[idx]
-                    advantage = torch.tensor(advantages[idx], device=self.accelerator.device, dtype=torch.float32)
-                    new_logprob, ref_logprob, entropy = self._sequence_logprob_and_entropy(
-                        transition.prompt_text,
-                        transition.screen_rgba,
-                        transition.completion_ids,
-                    )
-                    old_logprob = torch.tensor(transition.old_logprob, device=self.accelerator.device)
-                    ratio = torch.exp(new_logprob - old_logprob)
-                    clipped_ratio = torch.clamp(
-                        ratio,
-                        1.0 - self.config.train.ppo_clip_epsilon,
-                        1.0 + self.config.train.ppo_clip_epsilon,
-                    )
-                    policy_loss = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
-                    kl = torch.clamp(new_logprob - ref_logprob, min=0.0)
-                    loss = policy_loss + self.config.train.kl_beta * kl - self.config.train.entropy_beta * entropy
-                    losses.append(loss)
-                    kls.append(kl.detach())
-                    entropies.append(entropy.detach())
+                with self.accelerator.accumulate(self.model):
+                    batch_indices = indices[start : start + self.config.train.minibatch_size]
+                    losses = []
+                    kls = []
+                    entropies = []
+                    for idx in batch_indices:
+                        transition = transitions[idx]
+                        advantage = torch.tensor(advantages[idx], device=self.accelerator.device, dtype=torch.float32)
+                        new_logprob, ref_logprob, entropy = self._sequence_logprob_and_entropy(
+                            transition.prompt_text,
+                            transition.screen_rgba,
+                            transition.completion_ids,
+                        )
+                        old_logprob = torch.tensor(transition.old_logprob, device=self.accelerator.device)
+                        ratio = torch.exp(new_logprob - old_logprob)
+                        clipped_ratio = torch.clamp(
+                            ratio,
+                            1.0 - self.config.train.ppo_clip_epsilon,
+                            1.0 + self.config.train.ppo_clip_epsilon,
+                        )
+                        policy_loss = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
+                        kl = torch.clamp(new_logprob - ref_logprob, min=0.0)
+                        loss = policy_loss + self.config.train.kl_beta * kl - self.config.train.entropy_beta * entropy
+                        losses.append(loss)
+                        kls.append(kl.detach())
+                        entropies.append(entropy.detach())
 
-                batch_loss = torch.stack(losses).mean()
-                self.accelerator.backward(batch_loss)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.train.grad_clip_norm)
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
+                    batch_loss = torch.stack(losses).mean()
+                    self.accelerator.backward(batch_loss)
+                    
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.train.grad_clip_norm)
+                    
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 loss_sum += batch_loss.item()
                 kl_sum += torch.stack(kls).mean().item()
